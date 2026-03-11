@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -118,7 +118,7 @@ namespace EIP2042_Controller
             }
         }
 
-        private void ConnectButton_Click(object sender, RoutedEventArgs e)
+        private async void ConnectButton_Click(object sender, RoutedEventArgs e)
         {
             if (eipManager.IsConnected)
             {
@@ -128,12 +128,20 @@ namespace EIP2042_Controller
             {
                 try
                 {
+                    // 버튼 비활성화 (선택 사항)
+                    ConnectButton.IsEnabled = false;
                     eipManager.IpAddress = IpTextBox.Text;
-                    eipManager.Connect();
+                    
+                    // 비동기로 연결 수행 (UI가 멈추지 않음)
+                    await eipManager.ConnectAsync();
                 }
                 catch (Exception ex)
                 {
                     MessageBox.Show(ex.Message, "연결 에러", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+                finally
+                {
+                    ConnectButton.IsEnabled = true;
                 }
             }
         }

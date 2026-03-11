@@ -12,21 +12,27 @@ namespace EIP2042_Controller
     /// NuGet: 'Sres.Net.EEIP' (EEIP) 설치 필요
     /// 
     /// [사용 예시]
-    /// // 클래스 인스턴스 생성 및 IP 지정
+    /// // 인스턴스 생성 및 IP 설정
     /// var eipManager = new EIP2042Manager();
     /// eipManager.IpAddress = "192.168.0.10";
     /// 
-    /// // 1. 모듈 연결 시도 (에러 발생 시 Exception throw)
-    /// eipManager.Connect();
+    /// // 1. 모듈 연결 시도 (UI 프리징 방지를 위해 비동기 권장)
+    /// try {
+    ///     await eipManager.ConnectAsync();
+    /// } catch (Exception ex) {
+    ///     // 여기서 "장비의 응답이 없습니다" 등의 경고 메시지를 받아 UI에 표시할 수 있습니다.
+    ///     MessageBox.Show(ex.Message); 
+    /// }
     /// 
-    /// // 2. 채널 출력 제어 (인덱스: 0~15, true: ON, false: OFF)
-    /// eipManager.SetChannel(0, true); // 0번 채널 ON
-    /// bool state = eipManager.GetChannelStatus(0); // 현재 상태 읽기
+    /// // 2. 채널 출력 제어 (인덱스: 0~15)
+    /// if (eipManager.IsConnected) {
+    ///     eipManager.SetChannel(0, true); // 0번 ON
+    /// }
     /// 
-    /// // 3. 모듈 연결 해제
+    /// // 3. 연결 해제
     /// eipManager.Disconnect();
     /// 
-    /// ※ INotifyPropertyChanged 인터페이스를 지원하므로 WPF Binding(예: IsConnected, IpAddress)과 연동하기 쉽습니다.
+    /// ※ INotifyPropertyChanged 지원: IsConnected, IpAddress 속성을 UI에 바로 바인딩 가능합니다.
     /// </summary>
     public class EIP2042Manager : INotifyPropertyChanged
     {
@@ -64,12 +70,24 @@ namespace EIP2042_Controller
             eeipClient = new EEIPClient();
         }
 
+        public async System.Threading.Tasks.Task ConnectAsync()
+        {
+            await System.Threading.Tasks.Task.Run(() => Connect());
+        }
+
         public void Connect()
         {
             if (isConnected) return;
 
             try
             {
+                // 사전 체크: 장비가 네트워크에 있는지 1초(1000ms) 내에 먼저 확인 (포트 44818)
+                // 응답이 없으면 긴 타임아웃(프리징) 없이 바로 예외 발생
+                if (!PingHost(IpAddress, 44818, 1000))
+                {
+                    throw new Exception("장비의 응답이 없습니다. 전원이나 IP를 확인해주세요.");
+                }
+
                 eeipClient.IPAddress = IpAddress;
                 eeipClient.RegisterSession();
 
@@ -124,6 +142,28 @@ namespace EIP2042_Controller
         /// <summary>
         /// 장비의 실제 출력 상태(Readback)를 읽어와 내부 doStatus 및 O_T_IOData 버퍼를 동기화합니다.
         /// </summary>
+        /// <summary>
+        /// 특정 호스트의 포트가 열려있는지 타임아웃 내에 확인합니다.
+        /// </summary>
+        private bool PingHost(string hostUri, int portNumber, int timeoutMSec)
+        {
+            try
+            {
+                using (var client = new System.Net.Sockets.TcpClient())
+                {
+                    var result = client.BeginConnect(hostUri, portNumber, null, null);
+                    var success = result.AsyncWaitHandle.WaitOne(timeoutMSec);
+                    if (!success) return false;
+                    client.EndConnect(result);
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private void SyncStatusWithDevice()
         {
             try

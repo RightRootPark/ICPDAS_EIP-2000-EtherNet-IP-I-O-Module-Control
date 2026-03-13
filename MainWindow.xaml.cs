@@ -103,7 +103,7 @@ namespace EIP2042_Controller
         {
             if (eipManager.IsConnected)
             {
-                eipManager.Disconnect();
+                await eipManager.DisconnectAsync();
             }
             else
             {

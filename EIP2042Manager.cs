@@ -104,8 +104,8 @@ namespace EIP2042_Controller
 
             try
             {
-                // 기존 루프 정지 (이미 정지 상태여도 안전함)
-                StopMonitoring();
+                // 기존 루프가 있다면 정지
+                await StopMonitoringAsync();
 
                 await Task.Run(() => Connect());
 
@@ -173,82 +173,22 @@ namespace EIP2042_Controller
             _monitoringTask = Task.Run(() => MonitoringLoop(_loopCts.Token));
         }
 
-        private void StopMonitoring()
+        private async Task StopMonitoringAsync()
         {
-            _loopCts?.Cancel();
-            _monitoringTask?.Wait(1000); // 종료 대기
-            _loopCts?.Dispose();
-            _loopCts = null;
-        }
-
-        /// <summary>
-        /// 내부 자율 루프: 상태 조회 및 자동 재연결을 수행함.
-        /// </summary>
-        private async Task MonitoringLoop(CancellationToken token)
-        {
-            while (!token.IsCancellationRequested)
+            if (_loopCts != null)
             {
-                if (IsConnected)
+                _loopCts.Cancel();
+                if (_monitoringTask != null)
                 {
-                    try
-                    {
-                        // Explicit Message 대신 Implicit Buffer에서 안전하게 읽어옴 (UI 프리징 방지 핵심)
-                        byte[] data = eeipClient.T_O_IOData;
-                        if (data != null && data.Length >= 2)
-                        {
-                            bool changed = false;
-                            for (int i = 0; i < 16; i++)
-                            {
-                                int byteIdx = i / 8;
-                                int bitIdx = i % 8;
-                                bool bitValue = (data[byteIdx] & (1 << bitIdx)) != 0;
-                                
-                                if (readbackStates[i] != bitValue)
-                                {
-                                    readbackStates[i] = bitValue;
-                                    changed = true;
-                                }
-                            }
-
-                            if (changed)
-                                OnReadbackUpdated?.Invoke((bool[])readbackStates.Clone());
-                        }
-                    }
-                    catch
-                    {
-                        IsConnected = false; // 통신 에러 감지 시
-                    }
+                    // 최대 1초 대기하되 UI 쓰레드를 잡지 않음
+                    await Task.WhenAny(_monitoringTask, Task.Delay(1000));
                 }
-                else if (AutoReconnect)
-                {
-                    // 자동 재연결 시도
-                    try { await Task.Run(() => Connect()); } catch { }
-                    if (!IsConnected) await Task.Delay(ReconnectIntervalMS, token);
-                    continue;
-                }
-
-                await Task.Delay(PollIntervalMS, token);
+                _loopCts.Dispose();
+                _loopCts = null;
             }
         }
 
-        public void Disconnect()
-        {
-            StopMonitoring();
-            lock (connectionLock)
-            {
-                if (!IsConnected) return;
-                try
-                {
-                    eeipClient.ForwardClose();
-                    eeipClient.UnRegisterSession();
-                }
-                catch { }
-                finally
-                {
-                    IsConnected = false;
-                }
-            }
-        }
+
 
         public void SetChannel(int channel, bool value)
         {
@@ -331,6 +271,76 @@ namespace EIP2042_Controller
                 }
             }
             catch { }
+        }
+
+        /// <summary>
+        /// 내부 자율 루프: 상태 조회 및 자동 재연결을 수행함.
+        /// </summary>
+        private async Task MonitoringLoop(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                if (IsConnected)
+                {
+                    try
+                    {
+                        byte[] data = eeipClient.T_O_IOData;
+                        if (data != null && data.Length >= 2)
+                        {
+                            bool changed = false;
+                            for (int i = 0; i < 16; i++)
+                            {
+                                int byteIdx = i / 8;
+                                int bitIdx = i % 8;
+                                bool bitValue = (data[byteIdx] & (1 << bitIdx)) != 0;
+                                
+                                if (readbackStates[i] != bitValue)
+                                {
+                                    readbackStates[i] = bitValue;
+                                    changed = true;
+                                }
+                            }
+
+                            if (changed)
+                                OnReadbackUpdated?.Invoke((bool[])readbackStates.Clone());
+                        }
+                    }
+                    catch { IsConnected = false; }
+                }
+                else if (AutoReconnect)
+                {
+                    try { await Task.Run(() => Connect()); } catch { }
+                    if (!IsConnected) { await Task.Delay(ReconnectIntervalMS, token); continue; }
+                }
+                await Task.Delay(PollIntervalMS, token);
+            }
+        }
+
+        /// <summary>
+        /// 비동기로 모니터링을 중단하고 연결을 해제함.
+        /// </summary>
+        public async Task DisconnectAsync()
+        {
+            await StopMonitoringAsync();
+            await Task.Run(() =>
+            {
+                lock (connectionLock)
+                {
+                    if (!IsConnected) return;
+                    try
+                    {
+                        eeipClient.ForwardClose();
+                        eeipClient.UnRegisterSession();
+                    }
+                    catch { }
+                    finally { IsConnected = false; }
+                }
+            });
+        }
+
+        public void Disconnect()
+        {
+            DisconnectAsync().Wait(2000);
         }
 
         public void Dispose()

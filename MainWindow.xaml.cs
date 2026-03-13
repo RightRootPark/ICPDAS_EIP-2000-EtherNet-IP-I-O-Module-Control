@@ -10,7 +10,6 @@ namespace EIP2042_Controller
     {
         private EIP2042Manager eipManager;
         private Button[] channelButtons = new Button[16];
-        private DispatcherTimer updateTimer;
 
         public MainWindow()
         {
@@ -20,28 +19,23 @@ namespace EIP2042_Controller
             IpTextBox.Text = eipManager.IpAddress;
             
             eipManager.PropertyChanged += EipManager_PropertyChanged;
+            eipManager.OnReadbackUpdated += EipManager_OnReadbackUpdated; // 자율 업데이트 이벤트 구독
             
             InitializeChannelButtons();
-
-            // 백그라운드 Readback 상태 감시 타이머 (100ms마다 확인)
-            updateTimer = new DispatcherTimer();
-            updateTimer.Interval = TimeSpan.FromMilliseconds(100);
-            updateTimer.Tick += UpdateTimer_Tick;
         }
 
-        private void UpdateTimer_Tick(object sender, EventArgs e)
+        private void EipManager_OnReadbackUpdated(bool[] actualStates)
         {
-            if (!eipManager.IsConnected) return;
-
-            for (int i = 0; i < 16; i++)
+            // 백그라운드 쓰레드에서 오므로 Dispatcher 사용 필수
+            Dispatcher.BeginInvoke(new Action(() =>
             {
-                // 실제 기기의 수신(Readback) 상태를 1채널 비트 단위로 가져옴
-                bool actualState = eipManager.GetActualChannelStatus(i);
-                
-                // UI 버튼 색상 업데이트 (Tag를 저장하는 대신 실제 Readback을 바로 반영)
-                channelButtons[i].Background = actualState ? Brushes.LightGreen : Brushes.LightGray;
-                channelButtons[i].Tag = actualState; // 현재 클릭 토글을 위해 편의상 Tag 업데이트
-            }
+                for (int i = 0; i < 16; i++)
+                {
+                    bool state = actualStates[i];
+                    channelButtons[i].Background = state ? Brushes.LightGreen : Brushes.LightGray;
+                    channelButtons[i].Tag = state;
+                }
+            }));
         }
 
         private void InitializeChannelButtons()
@@ -56,7 +50,7 @@ namespace EIP2042_Controller
                     Height = 60,
                     Margin = new Thickness(5),
                     Background = Brushes.LightGray,
-                    Tag = false // 저장 상태: false = OFF, true = ON
+                    Tag = false
                 };
 
                 btn.Click += (s, e) =>
@@ -68,18 +62,8 @@ namespace EIP2042_Controller
                     }
 
                     bool currentState = (bool)btn.Tag;
-                    bool newState = !currentState;
-                    
-                    try
-                    {
-                        eipManager.SetChannel(index, newState);
-                        
-                        // 클릭 시 색상을 바로 변경하지 않음. 타이머가 실제 Readback 상태를 가져와 녹색으로 바꿔줄 거임
-                    }
-                    catch (Exception ex)
-                    {
-                        MessageBox.Show($"채널 {index} 상태 변경 실패: {ex.Message}", "에러", MessageBoxButton.OK, MessageBoxImage.Error);
-                    }
+                    eipManager.SetChannel(index, !currentState);
+                    // 색상 변경은 OnReadbackUpdated에서 처리됨
                 };
 
                 channelButtons[i] = btn;
@@ -98,16 +82,13 @@ namespace EIP2042_Controller
                         StatusLabel.Content = "Connected";
                         StatusLabel.Foreground = Brushes.Green;
                         ConnectButton.Content = "Disconnect";
-                        updateTimer.Start(); // 연결 성공 후 상태 감시 시작
                     }
                     else
                     {
                         StatusLabel.Content = "Disconnected";
                         StatusLabel.Foreground = Brushes.Red;
                         ConnectButton.Content = "Connect";
-                        updateTimer.Stop(); // 연결 끊어지면 타이머 중지
 
-                        // 연결 해제시 상태 초기화
                         foreach (var btn in channelButtons)
                         {
                             btn.Tag = false;
@@ -128,11 +109,8 @@ namespace EIP2042_Controller
             {
                 try
                 {
-                    // 버튼 비활성화 (선택 사항)
                     ConnectButton.IsEnabled = false;
                     eipManager.IpAddress = IpTextBox.Text;
-                    
-                    // 비동기로 연결 수행 (UI가 멈추지 않음)
                     await eipManager.ConnectAsync();
                 }
                 catch (Exception ex)
@@ -148,9 +126,9 @@ namespace EIP2042_Controller
 
         private void Window_Closed(object sender, EventArgs e)
         {
-            if (eipManager != null && eipManager.IsConnected)
+            if (eipManager != null)
             {
-                eipManager.Disconnect();
+                eipManager.Dispose(); // 자원 해제 및 감시 쓰레드 정지
             }
         }
     }

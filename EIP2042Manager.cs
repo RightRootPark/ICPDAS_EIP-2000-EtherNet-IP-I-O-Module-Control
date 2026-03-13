@@ -2,6 +2,8 @@ using Sres.Net.EEIP;
 using System;
 using System.ComponentModel;
 using System.Threading;
+using System.Threading.Tasks;
+using System.Net.Sockets;
 
 namespace EIP2042_Controller
 {
@@ -34,16 +36,28 @@ namespace EIP2042_Controller
     /// 
     /// ※ INotifyPropertyChanged 지원: IsConnected, IpAddress 속성을 UI에 바로 바인딩 가능합니다.
     /// </summary>
-    public class EIP2042Manager : INotifyPropertyChanged
+    public class EIP2042Manager : INotifyPropertyChanged, IDisposable
     {
         private EEIPClient eeipClient;
         private string ipAddress = "192.168.0.10";
         private bool isConnected;
 
-        // 16채널 DO 상태 추적 배열
-        private bool[] doStatus = new bool[16];
+        // 상태 및 제어 버퍼
+        private bool[] doStates = new bool[16];        // 명령 상태
+        private bool[] readbackStates = new bool[16];  // 실제 장비 상태 (Readback)
+
+        // 스레드 안정성 및 자율 주행용 멤버
+        private readonly object connectionLock = new object();
+        private CancellationTokenSource _loopCts;
+        private Task _monitoringTask;
+
+        // 설정 및 이벤트
+        public bool AutoReconnect { get; set; } = true;
+        public int PollIntervalMS { get; set; } = 100;
+        public int ReconnectIntervalMS { get; set; } = 5000;
 
         public event PropertyChangedEventHandler PropertyChanged;
+        public event Action<bool[]> OnReadbackUpdated; // 상태 변경 통지 이벤트
 
         public string IpAddress
         {
@@ -60,8 +74,11 @@ namespace EIP2042_Controller
             get => isConnected;
             private set
             {
-                isConnected = value;
-                OnPropertyChanged(nameof(IsConnected));
+                if (isConnected != value)
+                {
+                    isConnected = value;
+                    OnPropertyChanged(nameof(IsConnected));
+                }
             }
         }
 
@@ -70,209 +87,237 @@ namespace EIP2042_Controller
             eeipClient = new EEIPClient();
         }
 
-        public async System.Threading.Tasks.Task ConnectAsync()
+        /// <summary>
+        /// 비동기로 연결을 시작하고 자율 모니터링 루프를 실행함.
+        /// </summary>
+        public async Task ConnectAsync()
         {
-            await System.Threading.Tasks.Task.Run(() => Connect());
+            if (IsConnected) return;
+
+            // 기존 루프가 있다면 정지
+            StopMonitoring();
+
+            await Task.Run(() => Connect());
+
+            if (IsConnected)
+            {
+                StartMonitoring();
+            }
         }
 
         public void Connect()
         {
-            if (isConnected) return;
-
-            try
+            lock (connectionLock)
             {
-                // 사전 체크: 장비가 네트워크에 있는지 1초(1000ms) 내에 먼저 확인 (포트 44818)
-                // 응답이 없으면 긴 타임아웃(프리징) 없이 바로 예외 발생
-                if (!PingHost(IpAddress, 44818, 1000))
+                if (isConnected) return;
+
+                try
                 {
-                    throw new Exception("장비의 응답이 없습니다. 전원이나 IP를 확인해주세요.");
+                    // 사전 체크 (타임아웃 1초)
+                    if (!PingHost(IpAddress, 44818, 1000))
+                        throw new Exception("장비 응답 없음 (Ping/Port 44818 Failure)");
+
+                    eeipClient.IPAddress = IpAddress;
+                    eeipClient.RegisterSession();
+
+                    // Implicit Messaging (I/O) 설정
+                    eeipClient.O_T_InstanceID = 102;
+                    eeipClient.O_T_Length = 2;
+                    eeipClient.T_O_InstanceID = 101;
+                    eeipClient.T_O_Length = 2;
+                    eeipClient.ConfigurationAssemblyInstanceID = 100;
+
+                    eeipClient.O_T_RealTimeFormat = Sres.Net.EEIP.RealTimeFormat.Header32Bit;
+                    eeipClient.T_O_RealTimeFormat = Sres.Net.EEIP.RealTimeFormat.Modeless;
+                    eeipClient.RequestedPacketRate_O_T = 50000; // 50ms
+                    eeipClient.RequestedPacketRate_T_O = 50000; // 50ms
+
+                    // 연결 전 상태 선동기화
+                    PreSyncOutputBuffer();
+
+                    eeipClient.ForwardOpen();
+                    IsConnected = true;
+
+                    // 내부 상태 배열 초기 동기화
+                    SyncStatusWithDevice();
                 }
-
-                eeipClient.IPAddress = IpAddress;
-                eeipClient.RegisterSession();
-
-                // EIP-2042 Implicit Messaging 설정
-                eeipClient.O_T_InstanceID = 102; // Output Assembly
-                eeipClient.O_T_Length = 2;       // DO0~DO7, DO8~DO15
-                eeipClient.T_O_InstanceID = 101; // Input Assembly
-                eeipClient.T_O_Length = 2;       // Readback
-                eeipClient.ConfigurationAssemblyInstanceID = 100; // Configuration Assembly (매뉴얼 기준 0x64)
-                
-                eeipClient.O_T_RealTimeFormat = Sres.Net.EEIP.RealTimeFormat.Header32Bit;
-                eeipClient.T_O_RealTimeFormat = Sres.Net.EEIP.RealTimeFormat.Modeless;
-                eeipClient.RequestedPacketRate_O_T = 50000; // 50ms
-                eeipClient.RequestedPacketRate_T_O = 50000; // 50ms
-
-                // 중요: ForwardOpen 전에 장치의 현재 상태를 Explicit Message로 먼저 읽어와서 송신 버퍼에 채워넣음
-                // 이렇게 하면 연결되자마자 0(All OFF)이 송신되어 장치가 꺼지는 것을 방지할 수 있음
-                PreSyncOutputBuffer();
-
-                eeipClient.ForwardOpen();
-                IsConnected = true;
-
-                // 내부 로직용 doStatus 배열 동기화
-                SyncStatusWithDevice();
-            }
-            catch (Exception ex)
-            {
-                IsConnected = false;
-                throw new Exception($"EIP-2042 연결 실패: {ex.Message}");
+                catch (Exception ex)
+                {
+                    IsConnected = false;
+                    throw new Exception($"연결 실패: {ex.Message}");
+                }
             }
         }
 
-        /// <summary>
-        /// 연결 전 장치의 현재 상태를 읽어 송신 버퍼(O_T_IOData)에 미리 써넣습니다.
-        /// </summary>
-        private void PreSyncOutputBuffer()
+        private void StartMonitoring()
         {
-            try
-            {
-                // Instance 101 (Readback)을 읽어옴
-                byte[] readbackData = eeipClient.GetAttributeSingle(0x04, 101, 3);
-                if (readbackData != null && readbackData.Length >= 2)
-                {
-                    // Implicit Messaging 버퍼 준비
-                    eeipClient.O_T_IOData[0] = readbackData[0];
-                    eeipClient.O_T_IOData[1] = readbackData[1];
-                }
-            }
-            catch { /* 연결 전이라 실패할 수 있음 */ }
+            _loopCts = new CancellationTokenSource();
+            _monitoringTask = Task.Run(() => MonitoringLoop(_loopCts.Token));
+        }
+
+        private void StopMonitoring()
+        {
+            _loopCts?.Cancel();
+            _monitoringTask?.Wait(1000); // 종료 대기
+            _loopCts?.Dispose();
+            _loopCts = null;
         }
 
         /// <summary>
-        /// 장비의 실제 출력 상태(Readback)를 읽어와 내부 doStatus 및 O_T_IOData 버퍼를 동기화합니다.
+        /// 내부 자율 루프: 상태 조회 및 자동 재연결을 수행함.
         /// </summary>
-        /// <summary>
-        /// 특정 호스트의 포트가 열려있는지 타임아웃 내에 확인합니다.
-        /// </summary>
-        private bool PingHost(string hostUri, int portNumber, int timeoutMSec)
+        private async Task MonitoringLoop(CancellationToken token)
         {
-            try
+            while (!token.IsCancellationRequested)
             {
-                using (var client = new System.Net.Sockets.TcpClient())
+                if (IsConnected)
                 {
-                    var result = client.BeginConnect(hostUri, portNumber, null, null);
-                    var success = result.AsyncWaitHandle.WaitOne(timeoutMSec);
-                    if (!success) return false;
-                    client.EndConnect(result);
-                    return true;
-                }
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private void SyncStatusWithDevice()
-        {
-            try
-            {
-                // 이미 연결된 상태이므로 T_O_IOData 또는 GetAttributeSingle 사용 가능
-                byte[] readbackData = eeipClient.GetAttributeSingle(0x04, 101, 3);
-                if (readbackData != null && readbackData.Length >= 2)
-                {
-                    eeipClient.O_T_IOData[0] = readbackData[0];
-                    eeipClient.O_T_IOData[1] = readbackData[1];
-
-                    for (int i = 0; i < 16; i++)
+                    try
                     {
-                        int byteIndex = i / 8;
-                        int bitIndex = i % 8;
-                        doStatus[i] = (readbackData[byteIndex] & (1 << bitIndex)) != 0;
+                        // Explicit Message 대신 Implicit Buffer에서 안전하게 읽어옴 (UI 프리징 방지 핵심)
+                        byte[] data = eeipClient.T_O_IOData;
+                        if (data != null && data.Length >= 2)
+                        {
+                            bool changed = false;
+                            for (int i = 0; i < 16; i++)
+                            {
+                                int byteIdx = i / 8;
+                                int bitIdx = i % 8;
+                                bool bitValue = (data[byteIdx] & (1 << bitIdx)) != 0;
+                                
+                                if (readbackStates[i] != bitValue)
+                                {
+                                    readbackStates[i] = bitValue;
+                                    changed = true;
+                                }
+                            }
+
+                            if (changed)
+                                OnReadbackUpdated?.Invoke((bool[])readbackStates.Clone());
+                        }
+                    }
+                    catch
+                    {
+                        IsConnected = false; // 통신 에러 감지 시
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"SyncStatusWithDevice 에러: {ex.Message}");
+                else if (AutoReconnect)
+                {
+                    // 자동 재연결 시도
+                    try { await Task.Run(() => Connect()); } catch { }
+                    if (!IsConnected) await Task.Delay(ReconnectIntervalMS, token);
+                    continue;
+                }
+
+                await Task.Delay(PollIntervalMS, token);
             }
         }
 
         public void Disconnect()
         {
-            if (!IsConnected) return;
-
-            try
+            StopMonitoring();
+            lock (connectionLock)
             {
-                eeipClient.ForwardClose();
-                eeipClient.UnRegisterSession();
-            }
-            catch { }
-            finally
-            {
-                IsConnected = false;
-                // doStatus 초기화 제거: 다시 연결했을 때 이전 상태를 UI나 로직에서 참고할 수도 있으므로 명시적 초기화 안 함
-                // 실제 동기화는 Connect 시 SyncStatusWithDevice에서 수행됨
+                if (!IsConnected) return;
+                try
+                {
+                    eeipClient.ForwardClose();
+                    eeipClient.UnRegisterSession();
+                }
+                catch { }
+                finally
+                {
+                    IsConnected = false;
+                }
             }
         }
 
         public void SetChannel(int channel, bool value)
         {
-            if (!IsConnected) return;
-            if (channel < 0 || channel > 15) return;
+            if (!IsConnected || channel < 0 || channel > 15) return;
 
-            doStatus[channel] = value;
-
-            // 1. 현재 DO 상태 배열을 기반으로 2바이트(16비트) 조합 생성
-            byte[] outputData = new byte[2];
-            for (int i = 0; i < 16; i++)
+            lock (connectionLock)
             {
-                if (doStatus[i])
+                doStates[channel] = value;
+                byte[] outputData = new byte[2];
+                for (int i = 0; i < 16; i++)
                 {
-                    int byteIndex = i / 8;
-                    int bitIndex = i % 8;
-                    outputData[byteIndex] |= (byte)(1 << bitIndex);
+                    if (doStates[i])
+                        outputData[i / 8] |= (byte)(1 << (i % 8));
                 }
-            }
 
-            try
-            {
-                // 2. Implicit Message용 버퍼(O_T_IOData)도 동기화하여 백그라운드 전송 시 값이 유지되도록 함
-                eeipClient.O_T_IOData[0] = outputData[0];
-                eeipClient.O_T_IOData[1] = outputData[1];
-
-                // 3. Explicit Message를 통해 Assembly Object (Class 0x04), Instance 102 (0x66) 
-                // EIP-2042 Output Assembly Data를 통째로 덮어씁니다.
-                eeipClient.AssemblyObject.setInstance(102, outputData);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Explicit Message SetChannel Error: {ex.Message}");
+                try
+                {
+                    // Implicit 버퍼와 Explicit 쓰기를 동시 수행하여 즉각 반영 및 유지 보장
+                    eeipClient.O_T_IOData[0] = outputData[0];
+                    eeipClient.O_T_IOData[1] = outputData[1];
+                    eeipClient.AssemblyObject.setInstance(102, outputData);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"SetChannel Error: {ex.Message}");
+                }
             }
         }
 
         public bool GetChannelStatus(int channel)
         {
             if (channel < 0 || channel > 15) return false;
-            return doStatus[channel];
+            return doStates[channel];
         }
 
         public bool GetActualChannelStatus(int channel)
         {
-            if (!IsConnected || channel < 0 || channel > 15) return false;
+            if (channel < 0 || channel > 15) return false;
+            return readbackStates[channel]; // 내부 자율 루프에서 갱신된 값을 즉시 반환
+        }
 
+        private bool PingHost(string hostUri, int portNumber, int timeoutMSec)
+        {
             try
             {
-                // EIP-2042 Readback 시 Assembly Object (Class 0x04), Instance 101 (0x65), Attribute 3 (Data)를 Explicit Message로 직접 읽어옵니다.
-                // Implicit Message의 T_O_IOData 갱신이 원활하지 않은 경우를 대비한 방식입니다.
-                byte[] readbackData = eeipClient.GetAttributeSingle(0x04, 101, 3);
-                
-                if (readbackData != null && readbackData.Length >= 2)
+                using (var client = new TcpClient())
                 {
-                    int byteIndex = channel / 8;
-                    int bitIndex = channel % 8;
-                    byte currentData = readbackData[byteIndex];
-                    return (currentData & (1 << bitIndex)) != 0;
+                    var result = client.BeginConnect(hostUri, portNumber, null, null);
+                    return result.AsyncWaitHandle.WaitOne(timeoutMSec);
                 }
             }
-            catch(Exception ex)
-            {
-                // 실패 시 로그를 남길 수 있으나, 타이머에서 주기적으로 호출되므로 예외를 삼키고 false 반환
-                Console.WriteLine($"Explicit Message GetActualChannelStatus Error: {ex.Message}");
-            }
+            catch { return false; }
+        }
 
-            return false;
+        private void PreSyncOutputBuffer()
+        {
+            try
+            {
+                byte[] data = eeipClient.GetAttributeSingle(0x04, 101, 3);
+                if (data != null && data.Length >= 2)
+                {
+                    eeipClient.O_T_IOData[0] = data[0];
+                    eeipClient.O_T_IOData[1] = data[1];
+                }
+            }
+            catch { }
+        }
+
+        private void SyncStatusWithDevice()
+        {
+            try
+            {
+                byte[] data = eeipClient.GetAttributeSingle(0x04, 101, 3);
+                if (data != null && data.Length >= 2)
+                {
+                    for (int i = 0; i < 16; i++)
+                        readbackStates[i] = (data[i / 8] & (1 << (i % 8))) != 0;
+                    
+                    OnReadbackUpdated?.Invoke((bool[])readbackStates.Clone());
+                }
+            }
+            catch { }
+        }
+
+        public void Dispose()
+        {
+            Disconnect();
         }
 
         protected void OnPropertyChanged(string propertyName)

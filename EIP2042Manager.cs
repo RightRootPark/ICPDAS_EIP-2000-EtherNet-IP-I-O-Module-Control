@@ -87,21 +87,39 @@ namespace EIP2042_Controller
             eeipClient = new EEIPClient();
         }
 
+        private bool _isConnecting = false; // 중복 호출 방지 플래그
+
         /// <summary>
-        /// 비동기로 연결을 시작하고 자율 모니터링 루프를 실행함.
+        /// 비동기로 연결을 시작하고 자율 모니터링 루프를 실행함. (중복 호출 방지 포함)
         /// </summary>
         public async Task ConnectAsync()
         {
-            if (IsConnected) return;
+            if (IsConnected || _isConnecting) return;
 
-            // 기존 루프가 있다면 정지
-            StopMonitoring();
-
-            await Task.Run(() => Connect());
-
-            if (IsConnected)
+            lock (connectionLock)
             {
-                StartMonitoring();
+                if (IsConnected || _isConnecting) return;
+                _isConnecting = true;
+            }
+
+            try
+            {
+                // 기존 루프 정지 (이미 정지 상태여도 안전함)
+                StopMonitoring();
+
+                await Task.Run(() => Connect());
+
+                if (IsConnected)
+                {
+                    StartMonitoring();
+                }
+            }
+            finally
+            {
+                lock (connectionLock)
+                {
+                    _isConnecting = false;
+                }
             }
         }
 
